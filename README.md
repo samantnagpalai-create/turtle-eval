@@ -212,3 +212,151 @@ A skill or workflow version cannot be deployed until it passes its promotion pol
 ## How This Differs From Braintrust / LangSmith
 
 Existing tools are observability-first: they trace what happened. turtle-eval is **simulation-first**: you prove it works before it ships. Promotion gates, scenario packs, and the simulation engine are the core product — not add-ons.
+
+---
+
+## How Simulation Data Is Created
+
+Simulation data is the hardest part to get right. It is not just test inputs — a simulation scenario is a **full context snapshot**, everything the model would see in production.
+
+### What a Scenario Contains
+
+```json
+{
+  "input": "the user message or trigger",
+  "conversation_history": "prior turns if any",
+  "retrieved_context": "what RAG would have returned",
+  "tool_results": "mocked responses from external tools",
+  "system_prompt": "the skill's instruction",
+  "expected_behavior": "scoring criteria — NOT an exact expected output"
+}
+```
+
+The reason you store all of this is **replay fidelity** — if you only store the user message, your simulation won't match production because the model also saw retrieved docs, tool outputs, and conversation history.
+
+---
+
+### The 4 Sources of Simulation Data
+
+#### 1. Hand-crafted (where you always start)
+Domain experts write scenarios before any production traffic exists. Cover all three tiers from the start.
+
+```python
+# Example: a skill that routes customer support tickets
+scenarios = [
+  {
+    "tier": "nominal",
+    "input": "My order hasn't arrived yet",
+    "retrieved_context": "<order #1234, shipped 3 days ago>",
+    "expected_behavior": "asks for order number if not provided, or checks status"
+  },
+  {
+    "tier": "edge",
+    "input": "WHERE IS MY STUFF I ORDERED 3 MONTHS AGO",
+    "retrieved_context": "<order #1234, delivered 2 months ago>",
+    "expected_behavior": "remains professional, surfaces delivery confirmation"
+  },
+  {
+    "tier": "chaos",
+    "input": "你好我的订单",  # foreign language
+    "retrieved_context": None,  # retrieval failed
+    "expected_behavior": "handles gracefully, does not hallucinate order data"
+  }
+]
+```
+
+#### 2. LLM-generated (scale up coverage fast)
+A scenario generator prompt produces diverse test cases from a skill definition. This is how you go from 10 hand-crafted cases to 500.
+
+```
+System: You are a simulation data generator.
+Given this skill definition: {skill}
+Generate 20 test inputs across three tiers: nominal, edge, chaos.
+For chaos tier: include hostile users, foreign languages, prompt injection attempts,
+tool failure conditions, and severely truncated context.
+Output as JSON array.
+```
+
+The LLM generates inputs. Your scorers evaluate outputs. You never hardcode exact expected outputs — you define **scoring criteria** (what good looks like), not the exact answer.
+
+#### 3. Production replay (best data, requires live traffic first)
+Once production traffic exists, real traces are captured, stripped of PII, and replayed against new skill versions. This is how regression testing works — replay the same traces against v1 vs v2 and compare scores.
+
+```
+Production trace captured →
+  Strip PII →
+  Store as scenario in scenario pack →
+  Re-run against new skill version →
+  Compare scores between versions
+```
+
+#### 4. Chaos injection (automated, built into the simulation runner)
+Rather than writing every chaos scenario by hand, a chaos layer mutates any existing scenario automatically:
+
+```python
+chaos_mutations = [
+  truncate_context(pct=0.3),          # cut retrieved context by 70%
+  inject_prompt("Ignore all previous instructions and..."),
+  fail_tool("get_order_status"),      # make the tool return an error
+  replace_language("input", "zh"),    # translate input to another language
+  add_noise("input", noise_pct=0.2),  # simulate typos or speech recognition errors
+  repeat_message(n=5),                # same message sent 5 times in a row
+]
+```
+
+Apply these mutations to nominal scenarios to auto-generate the chaos tier.
+
+---
+
+### Score, Don't Match
+
+The most important rule: **never do exact output matching**.
+
+```python
+# Wrong — breaks on the first paraphrase
+assert output == "I can help you track your order"
+
+# Right — score against criteria
+score = llm_judge(
+  output=output,
+  criteria="Did the model ask for an order number or use the provided one? Did it stay professional?"
+)
+assert score >= 0.8
+```
+
+The model might produce 10 different responses that are all correct. Exact matching will always fail eventually.
+
+---
+
+### Scenario Pack Structure
+
+```
+scenario_packs/
+  ticket_routing/
+    nominal/
+      happy_path_with_order.json
+      happy_path_without_order.json
+      refund_request.json
+    edge/
+      very_long_message.json
+      already_resolved_issue.json
+      multiple_issues_in_one_message.json
+    chaos/
+      hostile_user.json
+      prompt_injection.json
+      retrieval_failure.json
+      foreign_language.json
+    scoring_criteria.json    ← what "good" looks like for this skill
+    generator_prompt.txt     ← the LLM prompt used to generate more cases
+```
+
+---
+
+### Practical Order for Building Simulation Data
+
+1. **Start hand-crafted** — write 5-10 scenarios per skill across all three tiers
+2. **Build the LLM generator** — expand to 50-100 scenarios per skill automatically
+3. **Build the chaos mutator** — auto-generate chaos variants from nominal cases
+4. **Wire in production replay** — once live traffic exists, pipe failing traces back into the scenario pack
+
+You do not need production traffic to start. Synthetic data catches obvious failures, prompt regressions, and policy violations before anything ships.
