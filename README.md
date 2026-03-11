@@ -539,3 +539,76 @@ In Phase 2, `condition` is always `null` and every node has exactly one outgoing
 | Scenario versioning | Lock to input schema version, not skill version |
 | Chaos layer | Mutations on nominal scenarios, no stacking by default |
 | Workflow simulation | Linear first (Option B), DAG-ready schema so Option C requires no rewrite |
+
+---
+
+## Analysis of Samant's Recommendation
+
+The original simulation design applied chaos categorically — truncate context, fail a tool, hostile user input — based on human intuition about what types of things go wrong. Samant's recommendation is more principled: use data to find which input signals actually drive decisions, then focus chaos precisely on those signals.
+
+### The Signal-Driven Chaos Model
+
+Every skill has input signals. Not all signals matter equally. Some sit near decision boundaries — small changes in their value flip the model's output. Those are the signals worth stressing. The approach:
+
+**Step 1 — Signal analysis**
+Use historical traces or an initial round of annotated simulations to build a decision tree or regression over the skill's input signals. Extract feature importance scores (SHAP values or equivalent) to rank which signals most influence outcomes.
+
+**Step 2 — Boundary detection**
+For the top-ranked signals, find the values at which the model's output changes. These are the decision boundaries — the most fragile points in the model's behavior.
+
+**Step 3 — Parametric chaos generation**
+Instead of applying fixed categorical mutations, sample random values across the important signal dimensions, weighted toward decision boundaries. Each sample becomes a simulation scenario.
+
+**Step 4 — Annotate and iterate**
+Human annotators label the simulation outputs. Those labels feed back into the signal analysis. Each iteration produces a more accurate importance ranking, which produces better-targeted simulations. The loop tightens over time.
+
+```
+Historical data / initial annotations
+  ↓
+Signal analysis (decision tree / regression / SHAP values)
+  ↓
+Key signals identified with importance scores
+  ↓
+Parametric chaos generator samples near decision boundaries
+  ↓
+Simulations run → annotated
+  ↓
+Annotations feed back into signal analysis
+  ↓  (loop repeats, tightening each iteration)
+```
+
+### What This Changes in the Architecture
+
+A **signal analysis module** is now a first-class component of the simulation engine:
+
+```
+signal_analyzer/
+  feature_extractor.py     ← pulls input signals from trace data
+  importance_ranker.py     ← decision tree / regression / SHAP
+  boundary_detector.py     ← finds where output changes near a signal value
+  parametric_sampler.py    ← generates scenarios by sampling signal space
+```
+
+The annotation layer is no longer just a human review queue — it is the engine of continuous improvement, directly informing where the next round of simulations focuses.
+
+### System Robustness Is Deterministic — and Handled Differently
+
+Samant's signal-driven model applies to **model behavior robustness** — finding where the model makes wrong decisions given valid inputs. System robustness (tool failures, latency spikes, infrastructure chaos) is a separate and fundamentally **deterministic** problem.
+
+When a tool fails, the system does not need a probabilistic model to know what happened — the failure is observable and unambiguous. The correct response to these events is not a simulation of model behavior but a **human-in-the-loop fallback**: route the interaction to a human agent, log the failure, and flag it for infrastructure review.
+
+This means system robustness scenarios (tool failure, timeout, retrieval outage) are not fed into the signal analysis loop. They have a fixed, deterministic outcome:
+
+```
+Tool failure / latency breach / infrastructure chaos
+  ↓
+Deterministic detection (not model judgment)
+  ↓
+Human-in-the-loop handoff
+  ↓
+Failure logged + flagged for infra review
+```
+
+This keeps the two concerns cleanly separated:
+- **Signal-driven chaos** → model behavior robustness → probabilistic, iterative, annotation-powered
+- **Infrastructure chaos** → system robustness → deterministic, human-in-the-loop fallback
