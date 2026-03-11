@@ -360,3 +360,148 @@ scenario_packs/
 4. **Wire in production replay** — once live traffic exists, pipe failing traces back into the scenario pack
 
 You do not need production traffic to start. Synthetic data catches obvious failures, prompt regressions, and policy violations before anything ships.
+
+---
+
+## Simulation Core: Design Decisions
+
+Phase 2 involves five design decisions that gate everything else. These are documented here so the rationale is clear.
+
+---
+
+### Decision 1: How to Define a Skill
+
+The question is where the skill definition lives and what form it takes.
+
+**Option A — Config file (YAML/JSON)**
+```yaml
+name: ticket_router
+model: claude-sonnet-4-6
+system_prompt: "You are a support agent..."
+tools:
+  - get_order_status
+  - create_refund
+scoring_criteria:
+  - name: stays_professional
+  - name: uses_correct_tool
+```
+Simple, version-controlled, readable by non-engineers. Cannot express custom pre/post processing logic.
+
+**Option B — Python class**
+```python
+class TicketRouterSkill(Skill):
+    system_prompt = "You are a support agent..."
+    tools = [get_order_status, create_refund]
+
+    def preprocess(self, input): ...
+    def postprocess(self, output): ...
+```
+Full expressiveness. But the skill definition is now code — non-engineers cannot read or edit it.
+
+**Option C — Config + code (hybrid)**
+YAML defines the contract (prompt, tools, model, scoring criteria). A Python file handles any custom logic. The simulation engine reads both.
+
+**Decision: Option C.** The config is the contract. The code is the implementation. They live alongside each other in the repo.
+
+---
+
+### Decision 2: How to Mock Tools
+
+In production a skill calls real tools — APIs, databases, search indexes. In simulation you cannot.
+
+**Option A — Static mocks (hardcoded in the scenario file)**
+```json
+{
+  "tool_mocks": {
+    "get_order_status": {"status": "shipped", "eta": "2 days"}
+  }
+}
+```
+Simple and fully controlled. Tedious to write and does not test how the skill handles unexpected tool responses.
+
+**Option B — Mock factory (generates responses dynamically)**
+The simulation engine has a mock factory that takes the tool name and args and generates a realistic response from response templates defined per tool.
+
+**Option C — Recorded mocks (captured from production, replayed)**
+Real tool calls are recorded in production traces. Simulation replays those exact responses. Most faithful to reality but requires live traffic first.
+
+**Unresolved rule**: when a skill calls a tool that has no mock, the simulation fails the run (strict mode). No silent defaults.
+
+**Decision: Option A now, Option C as the long-term goal.** Start with static mocks. Wire in production recording in Phase 3 when traces exist.
+
+---
+
+### Decision 3: Scenario Pack Versioning
+
+When a skill is updated — new prompt, new tools, changed behavior — what happens to existing scenarios?
+
+**Option A — Scenarios are independent, always replayed**
+Scenarios do not know about skill versions. Every simulation runs all scenarios against the current skill. Validity issues surface at runtime.
+
+**Option B — Scenarios locked to skill version**
+Each scenario pack tags the skill version it was written for. Bumping the skill version requires explicit scenario migration.
+
+**Option C — Scenarios versioned by input schema only**
+If the skill's input schema did not change, old scenarios are still valid. If it changed, they require migration. The engine enforces this automatically.
+
+**Decision: Option C.** Scenarios break when the interface changes, not when the internals change. This is the right constraint.
+
+---
+
+### Decision 4: How the Chaos Layer Works
+
+**Option A — Explicit chaos scenarios**
+Chaos scenarios are written manually in the scenario pack. Precise but slow to scale.
+
+**Option B — Mutations applied to nominal scenarios**
+The chaos layer takes nominal scenarios and produces variants automatically:
+
+```python
+# Takes 1 nominal scenario, produces N chaos variants — one per mutation
+chaos_mutations = [
+    truncate_context(pct=0.3),       # cut retrieved context by 70%
+    inject_prompt_injection(),        # adversarial instruction injection
+    fail_tool("get_order_status"),    # force the tool to return an error
+    translate_input("zh"),            # translate input to another language
+    add_noise(pct=0.2),              # simulate typos or bad speech recognition
+    repeat_message(n=5),             # same message sent 5 times
+]
+```
+
+**Stacking rule**: mutations do not stack by default. Each mutation produces exactly one variant. Combinatorial stacking is opt-in per scenario pack. This keeps the chaos tier tractable and makes it clear what each scenario is testing.
+
+**Decision: Option B with no stacking by default.**
+
+---
+
+### Decision 5: Workflow Simulation
+
+**Option A — Simulate each skill independently**
+Workflows are never simulated directly. Each skill is tested in isolation. Simple but misses inter-skill failure modes.
+
+**Option B — Linear workflow simulation**
+A workflow is a sequence of skills. A context object passes from one skill to the next. No branching.
+
+**Option C — DAG workflow simulation**
+A workflow is a directed acyclic graph. Nodes are skills or tools. Edges carry outputs as inputs to the next node. Supports branching and parallel execution.
+
+```
+[intent_classifier] → [ticket_router] → [order_lookup] → [response_generator]
+                    ↘ [escalation_handler]
+```
+
+Option C is the correct long-term architecture but is significantly more complex. It requires Decisions 1–4 to be solved first.
+
+**Decision: Option B first (linear workflows), with a schema designed to upgrade to Option C without a rewrite.** The DAG engine is built only when real workflows require it.
+
+---
+
+### Decision Summary
+
+| Decision | Choice |
+|---|---|
+| Skill definition | Config (YAML) + optional Python for custom logic |
+| Tool mocking | Static mocks in scenario files, record-and-replay added in Phase 3 |
+| Scenario versioning | Lock to input schema version, not skill version |
+| Chaos layer | Mutations on nominal scenarios, no stacking by default |
+| Workflow simulation | Linear first, schema upgradeable to DAG |
