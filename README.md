@@ -369,39 +369,50 @@ Phase 2 involves five design decisions that gate everything else. These are docu
 
 ---
 
-### Decision 1: How to Define a Skill
+### Decision 1: How Teams Define Skills — LLM Ingestion Pipeline
 
-The question is where the skill definition lives and what form it takes.
+Teams do not write YAML configs by hand. They submit whatever they already have — existing code, API specs, prompt files, plain English descriptions, LangChain chains, OpenAI function definitions, anything — and an LLM ingestion agent normalizes it into a canonical skill definition.
 
-**Option A — Config file (YAML/JSON)**
+**Ingestion pipeline:**
+```
+Team submits artifact (code / prompt / spec / description)
+  ↓
+LLM ingestion agent parses the artifact
+  ↓
+Extracts: system prompt, tools, input schema, output schema, suggested scoring criteria
+  ↓
+Generates: canonical skill YAML + initial scenario pack (nominal tier)
+  ↓
+Team reviews and approves in the UI
+  ↓
+Skill is registered and available for simulation
+```
+
+**Canonical skill YAML (what the platform stores):**
 ```yaml
 name: ticket_router
+version: 1.0.0
 model: claude-sonnet-4-6
 system_prompt: "You are a support agent..."
+input_schema:
+  type: object
+  properties:
+    user_message: { type: string }
+    conversation_history: { type: array }
 tools:
-  - get_order_status
-  - create_refund
+  - name: get_order_status
+    description: "Looks up the current status of an order"
+    parameters: { ... }
 scoring_criteria:
   - name: stays_professional
+    description: "Response maintains professional tone throughout"
   - name: uses_correct_tool
+    description: "Calls the appropriate tool given the user intent"
+  - name: does_not_hallucinate
+    description: "Does not invent data not present in context"
 ```
-Simple, version-controlled, readable by non-engineers. Cannot express custom pre/post processing logic.
 
-**Option B — Python class**
-```python
-class TicketRouterSkill(Skill):
-    system_prompt = "You are a support agent..."
-    tools = [get_order_status, create_refund]
-
-    def preprocess(self, input): ...
-    def postprocess(self, output): ...
-```
-Full expressiveness. But the skill definition is now code — non-engineers cannot read or edit it.
-
-**Option C — Config + code (hybrid)**
-YAML defines the contract (prompt, tools, model, scoring criteria). A Python file handles any custom logic. The simulation engine reads both.
-
-**Decision: Option C.** The config is the contract. The code is the implementation. They live alongside each other in the repo.
+**Key rule**: the canonical YAML is the contract. The original submitted artifact is archived alongside it. Teams can edit the YAML after ingestion — the LLM output is a starting point, not a locked definition.
 
 ---
 
@@ -476,23 +487,46 @@ chaos_mutations = [
 
 ### Decision 5: Workflow Simulation
 
-**Option A — Simulate each skill independently**
-Workflows are never simulated directly. Each skill is tested in isolation. Simple but misses inter-skill failure modes.
+**Decision: Option B (linear workflows) with a schema designed to upgrade to Option C (DAG) without a rewrite.**
 
-**Option B — Linear workflow simulation**
-A workflow is a sequence of skills. A context object passes from one skill to the next. No branching.
+Build linear execution first — a workflow is a sequence of skills where a context object passes from one to the next. The schema is designed from day one to support DAG concepts (nodes, edges, conditions) so branching and parallel execution can be added later without migrating data or rewriting the engine.
 
-**Option C — DAG workflow simulation**
-A workflow is a directed acyclic graph. Nodes are skills or tools. Edges carry outputs as inputs to the next node. Supports branching and parallel execution.
+**Schema (DAG-ready from day one):**
 
+```json
+{
+  "id": "support_workflow_v1",
+  "nodes": [
+    { "id": "intent_classifier", "skill_id": "intent_classifier", "type": "skill" },
+    { "id": "ticket_router",     "skill_id": "ticket_router",     "type": "skill" },
+    { "id": "response_generator","skill_id": "response_generator","type": "skill" }
+  ],
+  "edges": [
+    {
+      "from": "intent_classifier",
+      "to": "ticket_router",
+      "condition": null,
+      "data_map": { "intent": "output.intent" }
+    },
+    {
+      "from": "ticket_router",
+      "to": "response_generator",
+      "condition": null,
+      "data_map": { "route": "output.route" }
+    }
+  ],
+  "entry_node": "intent_classifier",
+  "exit_nodes": ["response_generator"]
+}
 ```
-[intent_classifier] → [ticket_router] → [order_lookup] → [response_generator]
-                    ↘ [escalation_handler]
-```
 
-Option C is the correct long-term architecture but is significantly more complex. It requires Decisions 1–4 to be solved first.
+In Phase 2, `condition` is always `null` and every node has exactly one outgoing edge — linear execution. In a later phase, conditions are evaluated and multiple edges per node unlock branching and parallel execution. The schema does not change — only the engine's ability to evaluate conditions is added.
 
-**Decision: Option B first (linear workflows), with a schema designed to upgrade to Option C without a rewrite.** The DAG engine is built only when real workflows require it.
+**What this unlocks immediately without the DAG engine:**
+- Replay a full workflow trace end-to-end
+- Inject chaos at any specific node, not just the entry
+- Score at individual node level and at the workflow level
+- Detect failures with full upstream context
 
 ---
 
@@ -500,8 +534,8 @@ Option C is the correct long-term architecture but is significantly more complex
 
 | Decision | Choice |
 |---|---|
-| Skill definition | Config (YAML) + optional Python for custom logic |
-| Tool mocking | Static mocks in scenario files, record-and-replay added in Phase 3 |
+| Skill definition | LLM ingestion pipeline — teams submit anything, platform normalizes to canonical YAML |
+| Tool mocking | Static mocks in scenario files now, record-and-replay added in Phase 3 |
 | Scenario versioning | Lock to input schema version, not skill version |
 | Chaos layer | Mutations on nominal scenarios, no stacking by default |
-| Workflow simulation | Linear first, schema upgradeable to DAG |
+| Workflow simulation | Linear first (Option B), DAG-ready schema so Option C requires no rewrite |
